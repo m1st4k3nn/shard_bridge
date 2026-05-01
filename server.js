@@ -134,7 +134,42 @@ const server = http.createServer((req, res) => {
       return json(res, 200, { ready: false });
     }
 
-    // ── GET /poll?userId=xxx  ← Chrome extension ──────────────────────────────
+    // ── GET /jobs?userId=xxx  ← Chrome extension (simple interval poll) ───────
+    // Returns all pending fresh jobs and REMOVES them from the queue immediately.
+    // The extension processes them and calls /respond with the result.
+    // The plugin polls /result to get the response.
+    if (url === "/jobs" && req.method === "GET") {
+      const userId = new URL(req.url, "http://x").searchParams.get("userId");
+      if (!userId) return json(res, 400, { error: "userId required" });
+
+      const queue = getOrCreate(userId);
+      const now = Date.now();
+
+      const freshJobs = [];
+      const remaining = [];
+
+      for (const job of queue) {
+        const age = now - (job.pushedAt || 0);
+        if (age > JOB_TTL_MS) {
+          // Stale — clean up and discard
+          const key = `${userId}:${job.requestId}`;
+          pendingResults.delete(key);
+          pendingResponds.delete(key);
+          console.log(`[/jobs] discarded stale requestId=${job.requestId}`);
+        } else {
+          // Fresh — dequeue it (extension takes ownership)
+          freshJobs.push(job);
+          console.log(`[/jobs] dequeued requestId=${job.requestId} for userId=${userId}`);
+        }
+      }
+
+      // Queue is now empty (all jobs either dispatched or discarded)
+      queues.set(userId, remaining);
+
+      return json(res, 200, freshJobs);
+    }
+
+    // ── GET /poll?userId=xxx  ← Chrome extension (legacy long-poll) ───────────
     // Long-polls: holds open until a job arrives (or 25 s timeout → null)
     if (url === "/poll" && req.method === "GET") {
       const userId = new URL(req.url, "http://x").searchParams.get("userId");
@@ -190,6 +225,10 @@ const server = http.createServer((req, res) => {
       if (resolve) {
         resolve(data);
         pendingResponds.delete(key);
+        // Remove the job from the queue so the extension doesn't re-process it
+        if (queues.has(userId)) {
+          queues.set(userId, queues.get(userId).filter(j => j.requestId !== requestId));
+        }
         console.log(`[/respond] userId=${userId} requestId=${requestId} resolved`);
         return json(res, 200, { ok: true });
       }
