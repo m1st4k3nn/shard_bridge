@@ -99,8 +99,10 @@ const server = http.createServer((req, res) => {
         const { res: pollRes, timer } = pollers.get(userId);
         clearTimeout(timer);
         pollers.delete(userId);
+        console.log(`[/push] waking poller for userId=${userId} requestId=${requestId}`);
         json(pollRes, 200, job);
       } else {
+        console.log(`[/push] no active poller for userId=${userId}, queuing job`);
         getOrCreate(userId).push(job);
       }
 
