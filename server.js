@@ -157,17 +157,22 @@ const server = http.createServer((req, res) => {
         console.log(`[/poll] userId=${userId} discarded stale requestId=${job.requestId} (age=${age}ms)`);
       }
 
-      // No fresh job — hold the connection open for up to 25 s
+      // No fresh job — hold the connection open for up to 10 s.
+      // Keeping this short avoids Railway's reverse-proxy idle timeout
+      // killing the connection before we get a chance to respond.
+      console.log(`[/poll] userId=${userId} holding connection`);
       const timer = setTimeout(() => {
         pollers.delete(userId);
+        console.log(`[/poll] userId=${userId} timeout, returning null`);
         json(res, 200, null); // null = nothing to do, extension should re-poll
-      }, 25_000);
+      }, 10_000);
 
       pollers.set(userId, { res, timer });
 
       req.on("close", () => {
         clearTimeout(timer);
         pollers.delete(userId);
+        console.log(`[/poll] userId=${userId} connection closed by client`);
       });
       return;
     }
