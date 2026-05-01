@@ -1,23 +1,22 @@
-// server.js
-// Deploy on Railway / Render / Fly.io / any Node host
-// No dependencies beyond Node built-ins
 
 const http = require("http");
 const crypto = require("crypto");
 
 const PORT = process.env.PORT || 3000;
+const JOB_TTL_MS = 30_000; // jobs older than 30s are discarded
 
-// In-memory job queue — keyed by userId
-// { [userId]: { requestId, data, resolve, timer }[] }
 const queues = new Map();
-
-// Active long-poll connections from extensions
-// { [userId]: { res, timer } }
 const pollers = new Map();
+const pendingResults = new Map();
+const pendingResponds = new Map();
 
 function getOrCreate(userId) {
   if (!queues.has(userId)) queues.set(userId, []);
   return queues.get(userId);
+}
+
+function isExpired(job) {
+  return Date.now() - (job._enqueuedAt || 0) > JOB_TTL_MS;
 }
 
 function json(res, status, data) {
@@ -42,7 +41,7 @@ const server = http.createServer((req, res) => {
     const data = body ? JSON.parse(body) : {};
     const url = req.url.split("?")[0];
 
-    // ── POST /push  ← Roblox plugin (push/poll pattern) ──────────────────
+    // ── POST /push  <- Roblox plugin ──────────────────────────────────────
     if (url === "/push" && req.method === "POST") {
       const { userId, requestId } = data;
       if (!userId)    return json(res, 400, { error: "userId required" });
@@ -50,16 +49,16 @@ const server = http.createServer((req, res) => {
 
       console.log(`[/push] userId=${userId} requestId=${requestId}`);
 
+      data._enqueuedAt = Date.now();
+
       const key = `${userId}:${requestId}`;
       pendingResults.set(key, { ready: false, data: null });
 
-      // Wire /respond to resolve this slot
       pendingResponds.set(key, (result) => {
         const slot = pendingResults.get(key);
         if (slot) { slot.ready = true; slot.data = result; }
       });
 
-      // Wake extension if already polling, else queue
       if (pollers.has(userId)) {
         const { res: pollRes, timer } = pollers.get(userId);
         clearTimeout(timer);
@@ -69,13 +68,12 @@ const server = http.createServer((req, res) => {
         getOrCreate(userId).push(data);
       }
 
-      // Clean up stale slots after 3 minutes
-      setTimeout(() => pendingResults.delete(key), 180000);
+      setTimeout(() => pendingResults.delete(key), 180_000);
 
       return json(res, 200, { ok: true, requestId });
     }
 
-    // ── GET /result?userId=xxx&requestId=xxx  ← Roblox plugin ────────────
+    // ── GET /result  <- Roblox plugin ─────────────────────────────────────
     if (url === "/result" && req.method === "GET") {
       const params = new URL(req.url, "http://x").searchParams;
       const userId    = params.get("userId");
@@ -93,54 +91,29 @@ const server = http.createServer((req, res) => {
       return json(res, 200, { ready: false });
     }
 
-    // ── POST /send  ←  Roblox plugin (legacy long-wait pattern) ──────────
-    // Body: { userId, prompt, ...anything }
-    if (url === "/send" && req.method === "POST") {
-      const { userId } = data;
-      if (!userId) return json(res, 400, { error: "userId required" });
-
-      const requestId = crypto.randomUUID();
-      data.requestId = requestId;
-
-      console.log(`[/send] userId=${userId} requestId=${requestId}`);
-
-      // If an extension is already long-polling for this user, wake it immediately
-      if (pollers.has(userId)) {
-        const { res: pollRes, timer } = pollers.get(userId);
-        clearTimeout(timer);
-        pollers.delete(userId);
-        json(pollRes, 200, data);
-
-        // Now wait for /respond before replying to Roblox
-        waitForRespond(userId, requestId, res);
-        return;
-      }
-
-      // Otherwise queue it and wait
-      const queue = getOrCreate(userId);
-      waitForRespond(userId, requestId, res);
-      queue.push(data);
-      return;
-    }
-
-    // ── GET /poll?userId=xxx  ←  Chrome extension ─────────────────────────
-    // Long-polls: holds open until a job arrives (or 25s timeout)
+    // ── GET /poll  <- Chrome extension ────────────────────────────────────
     if (url === "/poll" && req.method === "GET") {
       const userId = new URL(req.url, "http://x").searchParams.get("userId");
       if (!userId) return json(res, 400, { error: "userId required" });
 
       const queue = getOrCreate(userId);
 
-      // If there's already a queued job, return it immediately
-      if (queue.length > 0) {
-        const job = queue.shift();
-        return json(res, 200, job);
+      // Drain expired jobs before handing anything to the extension
+      while (queue.length > 0 && isExpired(queue[0])) {
+        const stale = queue.shift();
+        console.log(`[/poll] Discarding expired job ${stale.requestId} for userId=${userId}`);
+        const key = `${userId}:${stale.requestId}`;
+        pendingResults.delete(key);
+        pendingResponds.delete(key);
       }
 
-      // Otherwise hold the connection open
+      if (queue.length > 0) {
+        return json(res, 200, queue.shift());
+      }
+
       const timer = setTimeout(() => {
         pollers.delete(userId);
-        json(res, 200, null); // null = nothing to do
+        json(res, 200, null);
       }, 25000);
 
       pollers.set(userId, { res, timer });
@@ -151,8 +124,7 @@ const server = http.createServer((req, res) => {
       return;
     }
 
-    // ── POST /respond  ←  Chrome extension ───────────────────────────────
-    // Body: { userId, requestId, ...result }
+    // ── POST /respond  <- Chrome extension ───────────────────────────────
     if (url === "/respond" && req.method === "POST") {
       const { userId, requestId } = data;
       if (!userId || !requestId) return json(res, 400, { error: "userId + requestId required" });
@@ -176,21 +148,12 @@ const server = http.createServer((req, res) => {
   });
 });
 
-// Pending /respond callbacks — keyed by "userId:requestId"
-const pendingResponds = new Map();
-
-// Pending results for push/poll pattern — keyed by "userId:requestId"
-// { ready: bool, data: object|null }
-const pendingResults = new Map();
-
 function waitForRespond(userId, requestId, robloxRes) {
   const key = `${userId}:${requestId}`;
-
   const timer = setTimeout(() => {
     pendingResponds.delete(key);
     json(robloxRes, 504, { error: "Extension did not respond in time" });
   }, 30000);
-
   pendingResponds.set(key, (result) => {
     clearTimeout(timer);
     json(robloxRes, 200, result);
