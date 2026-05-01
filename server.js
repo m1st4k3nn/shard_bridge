@@ -42,7 +42,58 @@ const server = http.createServer((req, res) => {
     const data = body ? JSON.parse(body) : {};
     const url = req.url.split("?")[0];
 
-    // ── POST /send  ←  Roblox plugin ─────────────────────────────────────
+    // ── POST /push  ← Roblox plugin (push/poll pattern) ──────────────────
+    if (url === "/push" && req.method === "POST") {
+      const { userId, requestId } = data;
+      if (!userId)    return json(res, 400, { error: "userId required" });
+      if (!requestId) return json(res, 400, { error: "requestId required" });
+
+      console.log(`[/push] userId=${userId} requestId=${requestId}`);
+
+      const key = `${userId}:${requestId}`;
+      pendingResults.set(key, { ready: false, data: null });
+
+      // Wire /respond to resolve this slot
+      pendingResponds.set(key, (result) => {
+        const slot = pendingResults.get(key);
+        if (slot) { slot.ready = true; slot.data = result; }
+      });
+
+      // Wake extension if already polling, else queue
+      if (pollers.has(userId)) {
+        const { res: pollRes, timer } = pollers.get(userId);
+        clearTimeout(timer);
+        pollers.delete(userId);
+        json(pollRes, 200, data);
+      } else {
+        getOrCreate(userId).push(data);
+      }
+
+      // Clean up stale slots after 3 minutes
+      setTimeout(() => pendingResults.delete(key), 180000);
+
+      return json(res, 200, { ok: true, requestId });
+    }
+
+    // ── GET /result?userId=xxx&requestId=xxx  ← Roblox plugin ────────────
+    if (url === "/result" && req.method === "GET") {
+      const params = new URL(req.url, "http://x").searchParams;
+      const userId    = params.get("userId");
+      const requestId = params.get("requestId");
+      if (!userId || !requestId) return json(res, 400, { error: "userId + requestId required" });
+
+      const key = `${userId}:${requestId}`;
+      const slot = pendingResults.get(key);
+
+      if (!slot) return json(res, 200, { ready: false });
+      if (slot.ready) {
+        pendingResults.delete(key);
+        return json(res, 200, { ready: true, ...slot.data });
+      }
+      return json(res, 200, { ready: false });
+    }
+
+    // ── POST /send  ←  Roblox plugin (legacy long-wait pattern) ──────────
     // Body: { userId, prompt, ...anything }
     if (url === "/send" && req.method === "POST") {
       const { userId } = data;
@@ -127,6 +178,10 @@ const server = http.createServer((req, res) => {
 
 // Pending /respond callbacks — keyed by "userId:requestId"
 const pendingResponds = new Map();
+
+// Pending results for push/poll pattern — keyed by "userId:requestId"
+// { ready: bool, data: object|null }
+const pendingResults = new Map();
 
 function waitForRespond(userId, requestId, robloxRes) {
   const key = `${userId}:${requestId}`;
